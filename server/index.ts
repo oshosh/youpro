@@ -348,7 +348,12 @@ app.get('/vi/:videoId/:quality.jpg', async (req, res) => {
 
 // SPA fallback (프로덕션용)
 if (process.env.NODE_ENV === 'production') {
-  app.get('*', (req, res) => {
+  app.use((req, res, next) => {
+    // API 요청은 그대로 통과
+    if (req.path.startsWith('/api') || req.path.startsWith('/vi')) {
+      return next();
+    }
+    // 그 외 모든 요청은 index.html 반환
     res.sendFile(path.join(__dirname, '../dist/index.html'));
   });
 }
