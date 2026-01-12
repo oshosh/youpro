@@ -18,6 +18,9 @@ COPY . .
 # 프론트엔드 빌드
 RUN yarn build
 
+# youtubei.js 캐시 디렉토리 생성 (decipher에 필요)
+RUN mkdir -p .cache && chmod 777 .cache
+
 # 환경변수
 ENV NODE_ENV=production
 ENV PORT=3000

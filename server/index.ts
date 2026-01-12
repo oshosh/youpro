@@ -2,8 +2,25 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
-// @ts-ignore
-import Innertube from 'youtubei.js';
+import { Innertube, UniversalCache, Platform } from 'youtubei.js';
+
+// Custom JavaScript interpreter for deciphering URLs
+// Reference: https://ytjs.dev/guide/getting-started.html#providing-a-custom-javascript-interpreter
+Platform.shim.eval = async (data: any, env: any) => {
+  const properties: string[] = [];
+
+  if (env.n) {
+    properties.push(`n: exportedVars.nFunction("${env.n}")`);
+  }
+
+  if (env.sig) {
+    properties.push(`sig: exportedVars.sigFunction("${env.sig}")`);
+  }
+
+  const code = `${data.output}\nreturn { ${properties.join(', ')} }`;
+
+  return new Function(code)();
+};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -29,7 +46,7 @@ let client: any = null;
 let initPromise: Promise<boolean> | null = null;
 let initError: string | null = null;
 
-// InnerTube 초기화 (비동기, 논블로킹)
+// InnerTube 초기화 (ytmous 방식 - UniversalCache 사용)
 async function initInnerTube(): Promise<boolean> {
   if (client) return true;
   
@@ -37,12 +54,15 @@ async function initInnerTube(): Promise<boolean> {
   
   initPromise = (async () => {
     try {
-      console.log('📺 Initializing InnerTube...');
+      console.log('📺 Initializing InnerTube with UniversalCache...');
       client = await Innertube.create({
         location: 'US',
         lang: 'en',
+        // UniversalCache로 플레이어 정보 캐싱 (decipher에 필요)
+        cache: new UniversalCache(true, './.cache'),
       });
       console.log('✅ InnerTube client initialized');
+      console.log('📦 Player:', client.session?.player ? 'Ready' : 'Not ready');
       initError = null;
       return true;
     } catch (error: any) {
@@ -382,13 +402,15 @@ app.get('/api/proxy/:videoId', async (req, res) => {
       if (streamUrl) {
         console.log(`[Proxy] Using combined format: ${format.height}p`);
         
-        // Range 헤더 처리
+        // Range 헤더 처리 (ytmous 방식: googlebot User-Agent)
         const headers: Record<string, string> = {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'User-Agent': 'googlebot',
         };
         
         if (req.headers.range) {
           headers['Range'] = req.headers.range;
+        } else {
+          headers['Range'] = 'bytes=0-';
         }
         
         // YouTube에서 스트림 가져오기
