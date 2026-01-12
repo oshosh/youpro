@@ -1,6 +1,8 @@
 [phases.setup]
 nixPkgs = ["nodejs_20", "yarn"]
 
+[variables]
+NODE_VERSION = "20.19.0"
+
 [start]
 cmd = "npx tsx server/index.ts"
-
