@@ -329,6 +329,89 @@ app.get('/api/stream/:videoId', async (req, res) => {
   }
 });
 
+// 비디오 스트림 프록시 (CORS 우회)
+app.get('/api/proxy/:videoId', async (req, res) => {
+  const { videoId } = req.params;
+  const { itag } = req.query;
+  
+  if (!client) {
+    const success = await initInnerTube();
+    if (!success) {
+      return res.status(503).json({ error: 'Service initializing' });
+    }
+  }
+  
+  try {
+    const info = await client.getInfo(videoId);
+    const formats = [...(info.streaming_data?.formats || []), ...(info.streaming_data?.adaptive_formats || [])];
+    
+    // itag로 포맷 찾기 또는 영상+오디오 결합 포맷 선택
+    let format = itag 
+      ? formats.find((f: any) => f.itag == itag)
+      : formats.find((f: any) => f.has_video && f.has_audio);
+    
+    if (!format) format = formats[0];
+    
+    if (!format?.url && format?.decipher) {
+      format.url = await format.decipher(client.session.player);
+    }
+    
+    if (!format?.url) {
+      return res.status(404).json({ error: 'No stream URL found' });
+    }
+
+    // Range 헤더 처리 (시크 지원)
+    const range = req.headers.range;
+    const headers: Record<string, string> = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    };
+    
+    if (range) {
+      headers['Range'] = range;
+    }
+
+    // YouTube에서 스트림 가져오기
+    const response = await fetch(format.url, { headers });
+    
+    // 응답 헤더 설정
+    res.status(response.status);
+    
+    const contentType = response.headers.get('content-type');
+    const contentLength = response.headers.get('content-length');
+    const contentRange = response.headers.get('content-range');
+    const acceptRanges = response.headers.get('accept-ranges');
+    
+    if (contentType) res.setHeader('Content-Type', contentType);
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+    if (contentRange) res.setHeader('Content-Range', contentRange);
+    if (acceptRanges) res.setHeader('Accept-Ranges', acceptRanges);
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    
+    // 스트림 파이프
+    if (response.body) {
+      const reader = response.body.getReader();
+      
+      const pump = async (): Promise<void> => {
+        const { done, value } = await reader.read();
+        if (done) {
+          res.end();
+          return;
+        }
+        res.write(Buffer.from(value));
+        return pump();
+      };
+      
+      await pump();
+    } else {
+      const buffer = await response.arrayBuffer();
+      res.send(Buffer.from(buffer));
+    }
+  } catch (error: any) {
+    console.error('Proxy error:', error);
+    res.status(500).json({ error: 'Stream proxy failed', details: error.message });
+  }
+});
+
 // 썸네일 프록시
 app.get('/vi/:videoId/:quality.jpg', async (req, res) => {
   const { videoId, quality } = req.params;

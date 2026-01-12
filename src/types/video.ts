@@ -28,6 +28,7 @@ export interface PipedStream {
   height?: number;
   fps?: number;
   contentLength?: number;
+  itag?: string;
 }
 
 export interface PipedVideoInfo {

@@ -14,7 +14,7 @@ export default function VideoPlayer({ video }: VideoPlayerProps) {
   const [volume, setVolume] = useState(1);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showQualityMenu, setShowQualityMenu] = useState(false);
-  const [manualQuality, setManualQuality] = useState<string | null>(null);
+  const [selectedItag, setSelectedItag] = useState<string | null>(null);
 
   // 비디오+오디오가 합쳐진 스트림 (videoOnly가 false인 것)
   const combinedStreams: PipedStream[] = useMemo(() => {
@@ -28,17 +28,23 @@ export default function VideoPlayer({ video }: VideoPlayerProps) {
 
   // 초기 품질 설정 (720p 또는 가장 높은 품질)
   const selectedStream = useMemo(() => {
-    if (manualQuality) {
-      return qualityOptions.find((q) => q.url === manualQuality) || qualityOptions[0];
+    if (selectedItag) {
+      return qualityOptions.find((q) => q.itag === selectedItag) || qualityOptions[0];
     }
     if (qualityOptions.length === 0) return null;
     const preferred = qualityOptions.find((q) => q.quality === '720p') 
       || qualityOptions.find((q) => q.height === 720)
+      || qualityOptions.find((q) => q.quality === '360p')
       || qualityOptions[0];
     return preferred;
-  }, [qualityOptions, manualQuality]);
+  }, [qualityOptions, selectedItag]);
 
-  const selectedQuality = selectedStream?.url || '';
+  // 프록시 URL 생성 (서버를 통해 스트리밍)
+  const proxyUrl = useMemo(() => {
+    if (!video.videoId) return '';
+    const itag = selectedStream?.itag || selectedItag || '';
+    return `/api/proxy/${video.videoId}${itag ? `?itag=${itag}` : ''}`;
+  }, [video.videoId, selectedStream, selectedItag]);
 
   // HLS 스트림 사용 가능 여부
   const hlsUrl = video.hlsUrl;
@@ -96,9 +102,9 @@ export default function VideoPlayer({ video }: VideoPlayerProps) {
   };
 
   // 품질 변경
-  const handleQualityChange = (url: string) => {
+  const handleQualityChange = (itag: string) => {
     const currentTimeValue = videoRef.current?.currentTime || 0;
-    setManualQuality(url);
+    setSelectedItag(itag);
     setShowQualityMenu(false);
     
     // 비디오 로드 후 이전 재생 위치로 이동
@@ -107,16 +113,14 @@ export default function VideoPlayer({ video }: VideoPlayerProps) {
         videoRef.current.currentTime = currentTimeValue;
         if (isPlaying) videoRef.current.play();
       }
-    }, 100);
+    }, 500);
   };
 
   // 현재 품질 라벨
-  const currentQualityLabel = selectedStream?.quality || selectedStream?.height ? `${selectedStream.height}p` : 'Auto';
+  const currentQualityLabel = selectedStream?.quality || (selectedStream?.height ? `${selectedStream.height}p` : 'Auto');
 
   // 썸네일 URL (프록시 사용)
-  const thumbnailUrl = import.meta.env.DEV 
-    ? `/api/ytimg/vi/${video.videoId}/maxresdefault.jpg`
-    : (video.videoThumbnails?.[0]?.url || `https://i.ytimg.com/vi/${video.videoId}/maxresdefault.jpg`);
+  const thumbnailUrl = `/vi/${video.videoId}/maxresdefault.jpg`;
 
   return (
     <div 
@@ -126,7 +130,7 @@ export default function VideoPlayer({ video }: VideoPlayerProps) {
     >
       <video
         ref={videoRef}
-        src={hlsUrl || selectedQuality}
+        src={hlsUrl || proxyUrl}
         className="w-full h-full"
         onClick={togglePlay}
         onPlay={() => setIsPlaying(true)}
@@ -134,7 +138,7 @@ export default function VideoPlayer({ video }: VideoPlayerProps) {
         onTimeUpdate={() => setCurrentTime(videoRef.current?.currentTime || 0)}
         onLoadedMetadata={() => setDuration(videoRef.current?.duration || 0)}
         poster={thumbnailUrl}
-        crossOrigin="anonymous"
+        playsInline
       />
 
       {/* 컨트롤 오버레이 */}
@@ -239,10 +243,10 @@ export default function VideoPlayer({ video }: VideoPlayerProps) {
                     <div className="absolute bottom-full right-0 mb-2 bg-[var(--color-bg-dark)]/95 rounded-lg py-2 min-w-[120px] backdrop-blur-sm">
                       {qualityOptions.map((q, idx) => (
                         <button
-                          key={`${q.url}-${idx}`}
-                          onClick={() => handleQualityChange(q.url)}
+                          key={`${q.itag}-${idx}`}
+                          onClick={() => handleQualityChange(q.itag || '')}
                           className={`w-full px-4 py-2 text-left text-sm hover:bg-white/10 transition-colors ${
-                            q.url === selectedQuality ? 'text-[var(--color-primary)]' : ''
+                            q.itag === selectedStream?.itag ? 'text-[var(--color-primary)]' : ''
                           }`}
                         >
                           {q.quality || `${q.height}p`}
