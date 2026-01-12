@@ -329,10 +329,10 @@ app.get('/api/stream/:videoId', async (req, res) => {
   }
 });
 
-// 비디오 스트림 프록시 (CORS 우회)
+// 비디오 스트림 프록시 (CORS 우회) - download() 메서드 사용
 app.get('/api/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
-  const { itag } = req.query;
+  const { itag, quality } = req.query;
   
   if (!client) {
     const success = await initInnerTube();
@@ -343,55 +343,42 @@ app.get('/api/proxy/:videoId', async (req, res) => {
   
   try {
     const info = await client.getInfo(videoId);
-    const formats = [...(info.streaming_data?.formats || []), ...(info.streaming_data?.adaptive_formats || [])];
     
-    // itag로 포맷 찾기 또는 영상+오디오 결합 포맷 선택
-    let format = itag 
-      ? formats.find((f: any) => f.itag == itag)
-      : formats.find((f: any) => f.has_video && f.has_audio);
-    
-    if (!format) format = formats[0];
-    
-    if (!format?.url && format?.decipher) {
-      format.url = await format.decipher(client.session.player);
-    }
-    
-    if (!format?.url) {
-      return res.status(404).json({ error: 'No stream URL found' });
-    }
-
-    // Range 헤더 처리 (시크 지원)
-    const range = req.headers.range;
-    const headers: Record<string, string> = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    // download 옵션 설정
+    const downloadOptions: any = {
+      type: 'video+audio', // 영상+오디오 합친 스트림
+      quality: 'best',
     };
     
-    if (range) {
-      headers['Range'] = range;
+    // itag가 지정된 경우 해당 포맷 사용
+    if (itag) {
+      const formats = [...(info.streaming_data?.formats || []), ...(info.streaming_data?.adaptive_formats || [])];
+      const format = formats.find((f: any) => f.itag == itag);
+      if (format) {
+        downloadOptions.format = format;
+      }
+    }
+    
+    // 품질 지정된 경우
+    if (quality) {
+      downloadOptions.quality = quality;
     }
 
-    // YouTube에서 스트림 가져오기
-    const response = await fetch(format.url, { headers });
+    // youtubei.js의 download() 메서드로 직접 스트림 가져오기
+    // 이 방식은 IP 검증을 우회함
+    const stream = await info.download(downloadOptions);
     
     // 응답 헤더 설정
-    res.status(response.status);
-    
-    const contentType = response.headers.get('content-type');
-    const contentLength = response.headers.get('content-length');
-    const contentRange = response.headers.get('content-range');
-    const acceptRanges = response.headers.get('accept-ranges');
-    
-    if (contentType) res.setHeader('Content-Type', contentType);
-    if (contentLength) res.setHeader('Content-Length', contentLength);
-    if (contentRange) res.setHeader('Content-Range', contentRange);
-    if (acceptRanges) res.setHeader('Accept-Ranges', acceptRanges);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'public, max-age=3600');
     
-    // 스트림 파이프
-    if (response.body) {
-      const reader = response.body.getReader();
-      
-      const pump = async (): Promise<void> => {
+    // youtubei.js 스트림을 Express response에 파이프
+    // stream은 ReadableStream (Web Streams API)
+    const reader = stream.getReader();
+    
+    const pump = async (): Promise<void> => {
+      try {
         const { done, value } = await reader.read();
         if (done) {
           res.end();
@@ -399,34 +386,63 @@ app.get('/api/proxy/:videoId', async (req, res) => {
         }
         res.write(Buffer.from(value));
         return pump();
-      };
-      
-      await pump();
-    } else {
-      const buffer = await response.arrayBuffer();
-      res.send(Buffer.from(buffer));
-    }
+      } catch (err) {
+        console.error('Stream read error:', err);
+        res.end();
+      }
+    };
+    
+    // 클라이언트 연결 종료 시 스트림 정리
+    req.on('close', () => {
+      reader.cancel();
+    });
+    
+    await pump();
   } catch (error: any) {
     console.error('Proxy error:', error);
-    res.status(500).json({ error: 'Stream proxy failed', details: error.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Stream proxy failed', details: error.message });
+    }
   }
 });
 
-// 썸네일 프록시
+// 썸네일 프록시 (User-Agent 포함)
 app.get('/vi/:videoId/:quality.jpg', async (req, res) => {
   const { videoId, quality } = req.params;
-  const url = `https://i.ytimg.com/vi/${videoId}/${quality}.jpg`;
   
-  try {
-    const response = await fetch(url);
-    const buffer = await response.arrayBuffer();
-    
-    res.setHeader('Content-Type', 'image/jpeg');
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-    res.send(Buffer.from(buffer));
-  } catch (error) {
-    res.status(404).send('Thumbnail not found');
+  // 여러 썸네일 URL 시도 (fallback)
+  const thumbnailUrls = [
+    `https://i.ytimg.com/vi/${videoId}/${quality}.jpg`,
+    `https://img.youtube.com/vi/${videoId}/${quality}.jpg`,
+    `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    `https://img.youtube.com/vi/${videoId}/0.jpg`,
+  ];
+  
+  for (const url of thumbnailUrls) {
+    try {
+      const response = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Referer': 'https://www.youtube.com/',
+        }
+      });
+      
+      if (response.ok) {
+        const buffer = await response.arrayBuffer();
+        res.setHeader('Content-Type', 'image/jpeg');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        res.send(Buffer.from(buffer));
+        return;
+      }
+    } catch (error) {
+      console.log(`Thumbnail fetch failed for ${url}`);
+    }
   }
+  
+  // 모든 URL 실패 시 플레이스홀더 반환
+  res.status(404).send('Thumbnail not found');
 });
 
 // SPA fallback (프로덕션용)
