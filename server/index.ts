@@ -329,7 +329,7 @@ app.get('/api/stream/:videoId', async (req, res) => {
   }
 });
 
-// 비디오 스트림 프록시 (CORS 우회) - download() 메서드 사용
+// 비디오 스트림 프록시 (CORS 우회) - formats 직접 사용
 app.get('/api/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
   const { quality } = req.query;
@@ -344,46 +344,117 @@ app.get('/api/proxy/:videoId', async (req, res) => {
   try {
     const info = await client.getInfo(videoId);
     
-    // quality 파라미터를 youtubei.js가 이해하는 형식으로 변환
-    let targetQuality: any = 'best';
-    
+    // 요청된 품질에서 숫자만 추출 (예: "720p60" -> 720)
+    let targetHeight = 720;
     if (quality && typeof quality === 'string') {
-      // 720p60 같이 특수한 경우 처리
-      if (quality.includes('p')) {
-        targetQuality = quality;
-      } else {
-        targetQuality = quality;
+      const match = quality.match(/(\d+)/);
+      if (match) {
+        targetHeight = parseInt(match[1]);
       }
     }
     
-    console.log(`[Proxy] Video: ${videoId}, Quality: ${targetQuality}`);
+    console.log(`[Proxy] Video: ${videoId}, Target height: ${targetHeight}`);
 
-    // download 옵션 설정
-    const downloadOptions: any = {
+    // 방법 1: formats에서 영상+오디오 결합된 스트림 찾기 (360p, 720p만 있음)
+    const formats = info.streaming_data?.formats || [];
+    const combinedFormats = formats.filter((f: any) => f.has_video && f.has_audio);
+    
+    // 요청된 품질에 가장 가까운 포맷 찾기
+    let format = combinedFormats.find((f: any) => f.height === targetHeight);
+    if (!format) {
+      // 가장 높은 품질 선택
+      format = combinedFormats.sort((a: any, b: any) => (b.height || 0) - (a.height || 0))[0];
+    }
+    
+    if (format) {
+      // formats에서 URL 가져오기
+      let streamUrl = format.url;
+      
+      // URL이 없으면 decipher 시도
+      if (!streamUrl && format.decipher) {
+        try {
+          streamUrl = await format.decipher(client.session.player);
+        } catch (e) {
+          console.error('[Proxy] Decipher failed:', e);
+        }
+      }
+      
+      if (streamUrl) {
+        console.log(`[Proxy] Using combined format: ${format.height}p`);
+        
+        // Range 헤더 처리
+        const headers: Record<string, string> = {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        };
+        
+        if (req.headers.range) {
+          headers['Range'] = req.headers.range;
+        }
+        
+        // YouTube에서 스트림 가져오기
+        const response = await fetch(streamUrl, { headers });
+        
+        if (!response.ok) {
+          throw new Error(`YouTube returned ${response.status}`);
+        }
+        
+        // 응답 헤더 설정
+        res.status(response.status);
+        const contentType = response.headers.get('content-type');
+        const contentLength = response.headers.get('content-length');
+        const contentRange = response.headers.get('content-range');
+        
+        if (contentType) res.setHeader('Content-Type', contentType);
+        if (contentLength) res.setHeader('Content-Length', contentLength);
+        if (contentRange) res.setHeader('Content-Range', contentRange);
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        
+        // 스트림 파이프
+        if (response.body) {
+          const reader = response.body.getReader();
+          
+          const pump = async (): Promise<void> => {
+            try {
+              const { done, value } = await reader.read();
+              if (done) {
+                res.end();
+                return;
+              }
+              res.write(Buffer.from(value));
+              return pump();
+            } catch (err) {
+              console.error('Stream read error:', err);
+              res.end();
+            }
+          };
+          
+          req.on('close', () => {
+            reader.cancel();
+          });
+          
+          await pump();
+          return;
+        }
+      }
+    }
+    
+    // 방법 2: download() 메서드 사용 (ffmpeg 필요, 고화질용)
+    console.log(`[Proxy] Falling back to download() method`);
+    
+    const stream = await info.download({
       type: 'video+audio',
-      quality: targetQuality,
-      format: 'mp4'
-    };
-
-    // youtubei.js의 download() 메서드로 직접 스트림 가져오기
-    // ffmpeg가 서버에 설치되어 있어야 고화질(영상+오디오 합치기)이 가능합니다.
-    const stream = await info.download(downloadOptions).catch((err: any) => {
-      console.error('[Proxy] Download error:', err);
-      throw err;
+      quality: 'best',
     });
-
-    // stream이 유효한지 확인
+    
     if (!stream) {
       throw new Error('Failed to create stream');
     }
     
-    // 응답 헤더 설정
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'public, max-age=3600');
     
-    // youtubei.js 스트림을 Express response에 파이프
-    // stream은 ReadableStream (Web Streams API)
     const reader = stream.getReader();
     
     const pump = async (): Promise<void> => {
@@ -401,7 +472,6 @@ app.get('/api/proxy/:videoId', async (req, res) => {
       }
     };
     
-    // 클라이언트 연결 종료 시 스트림 정리
     req.on('close', () => {
       reader.cancel();
     });

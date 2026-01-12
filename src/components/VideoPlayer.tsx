@@ -15,27 +15,27 @@ export default function VideoPlayer({ video }: VideoPlayerProps) {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showQualityMenu, setShowQualityMenu] = useState(false);
 
-  // 모든 비디오 스트림에서 고유한 품질 옵션 추출
-  // youtubei.js의 download()가 자동으로 영상+오디오를 합쳐주므로 videoOnly도 포함
+  // 영상+오디오가 결합된 스트림만 추출 (videoOnly: false)
+  // 이것들만 바로 재생 가능 (보통 360p, 720p)
   const qualityOptions = useMemo(() => {
     const streams = video.videoStreams || [];
+    
+    // videoOnly가 false인 것만 (영상+오디오 결합된 스트림)
+    const combinedStreams = streams.filter((s) => !s.videoOnly && s.height && s.height > 0);
     
     // 고유한 해상도만 추출 (중복 제거)
     const uniqueQualities = new Map<number, { quality: string; height: number; itag?: string }>();
     
-    streams
-      .filter((s) => s.height && s.height > 0)
-      .forEach((s) => {
-        const height = s.height || 0;
-        // 더 높은 비트레이트 또는 첫 번째 것 선택
-        if (!uniqueQualities.has(height) || (s.bitrate || 0) > (uniqueQualities.get(height)?.height || 0)) {
-          uniqueQualities.set(height, {
-            quality: s.quality || `${height}p`,
-            height: height,
-            itag: s.itag,
-          });
-        }
-      });
+    combinedStreams.forEach((s) => {
+      const height = s.height || 0;
+      if (!uniqueQualities.has(height)) {
+        uniqueQualities.set(height, {
+          quality: `${height}p`,
+          height: height,
+          itag: s.itag,
+        });
+      }
+    });
     
     // 해상도 순으로 정렬 (높은 것부터)
     return Array.from(uniqueQualities.values()).sort((a, b) => b.height - a.height);
