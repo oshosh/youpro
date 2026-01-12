@@ -3,6 +3,7 @@ import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { Innertube, UniversalCache, Platform } from 'youtubei.js';
+import * as undici from 'undici';
 
 // Custom JavaScript interpreter for deciphering URLs
 // Reference: https://ytjs.dev/guide/getting-started.html#providing-a-custom-javascript-interpreter
@@ -387,7 +388,7 @@ app.get('/api/proxy/:videoId', async (req, res) => {
     }
     
     if (format) {
-      // formats에서 URL 가져오기
+      // formats에서 URL 가져오기 (ytmous 방식)
       let streamUrl = format.url;
       
       // URL이 없으면 decipher 시도
@@ -400,63 +401,44 @@ app.get('/api/proxy/:videoId', async (req, res) => {
       }
       
       if (streamUrl) {
+        // ytmous 방식: cpn 파라미터 추가 (Client Playback Nonce - 중요!)
+        if (info.cpn) {
+          streamUrl += '&cpn=' + info.cpn;
+        }
+        
         console.log(`[Proxy] Using combined format: ${format.height}p`);
         
-        // Range 헤더 처리 (ytmous 방식: googlebot User-Agent)
-        const headers: Record<string, string> = {
-          'User-Agent': 'googlebot',
-        };
+        // ytmous 방식: undici 사용, googlebot User-Agent, maxRedirections
+        const range = req.headers.range || 'bytes=0-';
         
-        if (req.headers.range) {
-          headers['Range'] = req.headers.range;
-        } else {
-          headers['Range'] = 'bytes=0-';
-        }
-        
-        // YouTube에서 스트림 가져오기
-        const response = await fetch(streamUrl, { headers });
-        
-        if (!response.ok) {
-          throw new Error(`YouTube returned ${response.status}`);
-        }
-        
-        // 응답 헤더 설정
-        res.status(response.status);
-        const contentType = response.headers.get('content-type');
-        const contentLength = response.headers.get('content-length');
-        const contentRange = response.headers.get('content-range');
-        
-        if (contentType) res.setHeader('Content-Type', contentType);
-        if (contentLength) res.setHeader('Content-Length', contentLength);
-        if (contentRange) res.setHeader('Content-Range', contentRange);
-        res.setHeader('Accept-Ranges', 'bytes');
-        res.setHeader('Cache-Control', 'public, max-age=3600');
-        
-        // 스트림 파이프
-        if (response.body) {
-          const reader = response.body.getReader();
-          
-          const pump = async (): Promise<void> => {
-            try {
-              const { done, value } = await reader.read();
-              if (done) {
-                res.end();
-                return;
-              }
-              res.write(Buffer.from(value));
-              return pump();
-            } catch (err) {
-              console.error('Stream read error:', err);
-              res.end();
-            }
-          };
-          
-          req.on('close', () => {
-            reader.cancel();
+        try {
+          // undici.request 사용 (ytmous 방식)
+          const response = await undici.request(streamUrl, {
+            headers: {
+              'User-Agent': 'googlebot',
+              range,
+            },
+            maxRedirections: 4,
           });
           
-          await pump();
+          // 응답 헤더 설정
+          res.status(response.statusCode);
+          
+          for (const h of ['Accept-Ranges', 'Content-Type', 'Content-Range', 'Content-Length', 'Cache-Control']) {
+            const headerValue = response.headers[h.toLowerCase()];
+            if (headerValue) res.setHeader(h, headerValue);
+          }
+          
+          // 스트림 파이프 (ytmous 방식)
+          for await (const chunk of response.body) {
+            if (res.closed) break;
+            res.write(chunk);
+          }
+          res.end();
           return;
+        } catch (err) {
+          console.error('[Proxy] Undici request failed:', err);
+          throw err;
         }
       }
     }
