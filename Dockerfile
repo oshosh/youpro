@@ -1,6 +1,9 @@
 # Node 20.19 사용
 FROM node:20.19-alpine
 
+# ffmpeg 설치 (youtubei.js 스트림 병합용)
+RUN apk add --no-cache ffmpeg
+
 WORKDIR /app
 
 # 패키지 파일 복사

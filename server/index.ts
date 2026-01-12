@@ -345,26 +345,37 @@ app.get('/api/proxy/:videoId', async (req, res) => {
     const info = await client.getInfo(videoId);
     
     // quality 파라미터를 youtubei.js가 이해하는 형식으로 변환
-    // 예: "1080p" -> "1080p", "720p" -> "720p", "360p" -> "360p"
-    let targetQuality: string = 'best';
+    let targetQuality: any = 'best';
     
     if (quality && typeof quality === 'string') {
-      // "1080p" -> "1080p" (그대로 사용)
-      targetQuality = quality;
+      // 720p60 같이 특수한 경우 처리
+      if (quality.includes('p')) {
+        targetQuality = quality;
+      } else {
+        targetQuality = quality;
+      }
     }
     
     console.log(`[Proxy] Video: ${videoId}, Quality: ${targetQuality}`);
 
     // download 옵션 설정
-    // type: 'video+audio'는 자동으로 영상과 오디오를 합쳐줌 (1080p 이상도 지원)
     const downloadOptions: any = {
       type: 'video+audio',
       quality: targetQuality,
+      format: 'mp4'
     };
 
     // youtubei.js의 download() 메서드로 직접 스트림 가져오기
-    // 이 방식은 IP 검증을 우회함 (서버에서 직접 다운로드하므로)
-    const stream = await info.download(downloadOptions);
+    // ffmpeg가 서버에 설치되어 있어야 고화질(영상+오디오 합치기)이 가능합니다.
+    const stream = await info.download(downloadOptions).catch((err: any) => {
+      console.error('[Proxy] Download error:', err);
+      throw err;
+    });
+
+    // stream이 유효한지 확인
+    if (!stream) {
+      throw new Error('Failed to create stream');
+    }
     
     // 응답 헤더 설정
     res.setHeader('Content-Type', 'video/mp4');
