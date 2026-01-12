@@ -2,26 +2,6 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { Innertube, UniversalCache, Platform } from 'youtubei.js';
-import * as undici from 'undici';
-
-// Custom JavaScript interpreter for deciphering URLs
-// Reference: https://ytjs.dev/guide/getting-started.html#providing-a-custom-javascript-interpreter
-Platform.shim.eval = async (data: any, env: any) => {
-  const properties: string[] = [];
-
-  if (env.n) {
-    properties.push(`n: exportedVars.nFunction("${env.n}")`);
-  }
-
-  if (env.sig) {
-    properties.push(`sig: exportedVars.sigFunction("${env.sig}")`);
-  }
-
-  const code = `${data.output}\nreturn { ${properties.join(', ')} }`;
-
-  return new Function(code)();
-};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -33,7 +13,7 @@ const PORT = process.env.PORT || 3001;
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization', 'Range']
 }));
 app.use(express.json());
 
@@ -42,62 +22,85 @@ if (process.env.NODE_ENV === 'production') {
   app.use(express.static(path.join(__dirname, '../dist')));
 }
 
-// InnerTube 클라이언트
-let client: any = null;
-let initPromise: Promise<boolean> | null = null;
-let initError: string | null = null;
+// Invidious 인스턴스 목록 (작동하는 인스턴스들)
+const INVIDIOUS_INSTANCES = [
+  'https://inv.nadeko.net',
+  'https://invidious.nerdvpn.de',
+  'https://invidious.jing.rocks',
+  'https://invidious.privacyredirect.de',
+  'https://iv.nboeck.de',
+  'https://invidious.protokolla.fi',
+  'https://yt.artemislena.eu',
+  'https://invidious.perennialte.ch',
+];
 
-// InnerTube 초기화 (ytmous 방식 - UniversalCache 사용)
-async function initInnerTube(): Promise<boolean> {
-  if (client) return true;
-  
-  if (initPromise) return initPromise;
-  
-  initPromise = (async () => {
+let currentInstanceIndex = 0;
+
+// 작동하는 Invidious 인스턴스 찾기
+async function getWorkingInstance(): Promise<string | null> {
+  for (let i = 0; i < INVIDIOUS_INSTANCES.length; i++) {
+    const idx = (currentInstanceIndex + i) % INVIDIOUS_INSTANCES.length;
+    const instance = INVIDIOUS_INSTANCES[idx];
+    
     try {
-      console.log('📺 Initializing InnerTube with UniversalCache...');
-      client = await Innertube.create({
-        location: 'US',
-        lang: 'en',
-        // UniversalCache로 플레이어 정보 캐싱 (decipher에 필요)
-        cache: new UniversalCache(true, './.cache'),
+      const response = await fetch(`${instance}/api/v1/stats`, {
+        signal: AbortSignal.timeout(5000),
       });
-      console.log('✅ InnerTube client initialized');
-      console.log('📦 Player:', client.session?.player ? 'Ready' : 'Not ready');
-      initError = null;
-      return true;
-    } catch (error: any) {
-      console.error('❌ Failed to initialize InnerTube:', error.message);
-      initError = error.message;
-      initPromise = null;
-      return false;
+      
+      if (response.ok) {
+        currentInstanceIndex = idx;
+        console.log(`[Invidious] Using instance: ${instance}`);
+        return instance;
+      }
+    } catch (e) {
+      console.log(`[Invidious] Instance ${instance} failed`);
     }
-  })();
+  }
   
-  return initPromise;
+  return null;
+}
+
+// Invidious API 요청
+async function invidiousRequest(endpoint: string): Promise<any> {
+  const instance = await getWorkingInstance();
+  if (!instance) {
+    throw new Error('No working Invidious instance found');
+  }
+  
+  const url = `${instance}${endpoint}`;
+  console.log(`[Invidious] Request: ${url}`);
+  
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    },
+    signal: AbortSignal.timeout(15000),
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Invidious returned ${response.status}`);
+  }
+  
+  return response.json();
 }
 
 // 루트 경로 - Railway 헬스 체크용
 app.get('/', (req, res) => {
-  if (process.env.NODE_ENV === 'production') {
-    // SPA 서빙
-    return res.sendFile(path.join(__dirname, '../dist/index.html'));
-  }
-  res.json({ 
-    status: 'ok', 
-    message: 'YouPro API Server',
-    innertube: client ? 'ready' : 'initializing',
-    error: initError
-  });
+  res.json({ status: 'ok', message: 'YouPro API Server (Invidious Proxy)' });
 });
 
-// 헬스 체크 - 항상 응답
-app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: client ? 'ok' : 'initializing', 
-    message: client ? 'InnerTube ready' : 'InnerTube initializing...',
-    error: initError
-  });
+// 헬스 체크
+app.get('/api/health', async (req, res) => {
+  try {
+    const instance = await getWorkingInstance();
+    if (instance) {
+      res.json({ status: 'ok', instance });
+    } else {
+      res.status(503).json({ status: 'error', message: 'No working Invidious instance' });
+    }
+  } catch (error: any) {
+    res.status(503).json({ status: 'error', message: error.message });
+  }
 });
 
 // 검색
@@ -108,38 +111,30 @@ app.get('/api/search', async (req, res) => {
     return res.status(400).json({ error: 'Query parameter "q" is required' });
   }
   
-  if (!client) {
-    const success = await initInnerTube();
-    if (!success) {
-      return res.status(503).json({ error: 'Service initializing, please try again', details: initError });
-    }
-  }
-  
   try {
-    const searchResults = await client.search(q as string);
+    const data = await invidiousRequest(`/api/v1/search?q=${encodeURIComponent(q as string)}&page=${page}`);
     
-    const results = (searchResults.videos || []).map((video: any) => ({
-      type: 'video',
-      title: video.title?.text || video.title || '',
-      videoId: video.id,
-      author: video.author?.name || video.channel?.name || '',
-      authorId: video.author?.id || video.channel?.id || '',
-      authorUrl: `/channel/${video.author?.id || video.channel?.id || ''}`,
-      authorVerified: video.author?.is_verified || false,
-      videoThumbnails: [{ 
-        url: video.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${video.id}/mqdefault.jpg`,
-        width: 320, 
-        height: 180 
-      }],
-      description: video.description?.text || video.snippets?.[0]?.text?.text || '',
-      viewCount: video.view_count?.text ? parseInt(video.view_count.text.replace(/[^0-9]/g, '')) : 0,
-      viewCountText: video.short_view_count?.text || video.view_count?.text || '',
-      publishedText: video.published?.text || '',
-      lengthSeconds: video.duration?.seconds || 0,
-      liveNow: video.is_live || false,
-    }));
-
-    res.json({ results, nextpage: searchResults.has_continuation ? String(parseInt(page as string) + 1) : '' });
+    // Invidious 형식을 우리 형식으로 변환
+    const results = data
+      .filter((item: any) => item.type === 'video')
+      .map((video: any) => ({
+        type: 'video',
+        title: video.title || '',
+        videoId: video.videoId,
+        author: video.author || '',
+        authorId: video.authorId || '',
+        authorUrl: `/channel/${video.authorId || ''}`,
+        authorVerified: video.authorVerified || false,
+        videoThumbnails: video.videoThumbnails || [{ url: `/vi/${video.videoId}/mqdefault.jpg`, width: 320, height: 180 }],
+        description: video.description || '',
+        viewCount: video.viewCount || 0,
+        viewCountText: video.viewCountText || '',
+        publishedText: video.publishedText || '',
+        lengthSeconds: video.lengthSeconds || 0,
+        liveNow: video.liveNow || false,
+      }));
+    
+    res.json({ results, nextpage: String(parseInt(page as string) + 1) });
   } catch (error: any) {
     console.error('Search error:', error);
     res.status(500).json({ error: 'Search failed', details: error.message });
@@ -148,71 +143,32 @@ app.get('/api/search', async (req, res) => {
 
 // 트렌딩
 app.get('/api/trending', async (req, res) => {
-  if (!client) {
-    const success = await initInnerTube();
-    if (!success) {
-      return res.status(503).json({ error: 'Service initializing, please try again', details: initError });
-    }
-  }
+  const { region = 'KR' } = req.query;
   
   try {
-    const trending = await client.getTrending();
+    const data = await invidiousRequest(`/api/v1/trending?region=${region}`);
     
-    const results = (trending.videos || trending.contents || []).slice(0, 30).map((video: any) => {
-      const v = video.content || video;
-      return {
-        type: 'video',
-        title: v.title?.text || v.title || '',
-        videoId: v.id || v.video_id,
-        author: v.author?.name || v.channel?.name || '',
-        authorId: v.author?.id || v.channel?.id || '',
-        authorUrl: `/channel/${v.author?.id || v.channel?.id || ''}`,
-        authorVerified: v.author?.is_verified || false,
-        videoThumbnails: [{ 
-          url: v.thumbnails?.[0]?.url || `https://i.ytimg.com/vi/${v.id || v.video_id}/mqdefault.jpg`,
-          width: 320, 
-          height: 180 
-        }],
-        description: '',
-        viewCount: 0,
-        viewCountText: v.short_view_count?.text || v.view_count?.text || '',
-        publishedText: v.published?.text || '',
-        lengthSeconds: v.duration?.seconds || 0,
-        liveNow: v.is_live || false,
-      };
-    });
-
+    const results = data.map((video: any) => ({
+      type: 'video',
+      title: video.title || '',
+      videoId: video.videoId,
+      author: video.author || '',
+      authorId: video.authorId || '',
+      authorUrl: `/channel/${video.authorId || ''}`,
+      authorVerified: video.authorVerified || false,
+      videoThumbnails: video.videoThumbnails || [{ url: `/vi/${video.videoId}/mqdefault.jpg`, width: 320, height: 180 }],
+      description: video.description || '',
+      viewCount: video.viewCount || 0,
+      viewCountText: video.viewCountText || '',
+      publishedText: video.publishedText || '',
+      lengthSeconds: video.lengthSeconds || 0,
+      liveNow: video.liveNow || false,
+    }));
+    
     res.json(results);
   } catch (error: any) {
     console.error('Trending error:', error);
-    
-    // fallback: 검색으로 인기 영상 가져오기
-    try {
-      const searchResults = await client.search('music 2025');
-      const results = (searchResults.videos || []).slice(0, 20).map((video: any) => ({
-        type: 'video',
-        title: video.title?.text || video.title || '',
-        videoId: video.id,
-        author: video.author?.name || '',
-        authorId: video.author?.id || '',
-        authorUrl: `/channel/${video.author?.id || ''}`,
-        authorVerified: false,
-        videoThumbnails: [{ 
-          url: `https://i.ytimg.com/vi/${video.id}/mqdefault.jpg`,
-          width: 320, 
-          height: 180 
-        }],
-        description: '',
-        viewCount: 0,
-        viewCountText: video.short_view_count?.text || '',
-        publishedText: video.published?.text || '',
-        lengthSeconds: video.duration?.seconds || 0,
-        liveNow: false,
-      }));
-      res.json(results);
-    } catch (fallbackError: any) {
-      res.status(500).json({ error: 'Trending fetch failed', details: error.message });
-    }
+    res.status(500).json({ error: 'Trending fetch failed', details: error.message });
   }
 });
 
@@ -220,92 +176,88 @@ app.get('/api/trending', async (req, res) => {
 app.get('/api/video/:videoId', async (req, res) => {
   const { videoId } = req.params;
   
-  if (!client) {
-    const success = await initInnerTube();
-    if (!success) {
-      return res.status(503).json({ error: 'Service initializing', details: initError });
-    }
-  }
-  
   try {
-    const info = await client.getInfo(videoId);
+    const data = await invidiousRequest(`/api/v1/videos/${videoId}`);
     
-    const formats = info.streaming_data?.formats || [];
-    const adaptiveFormats = info.streaming_data?.adaptive_formats || [];
+    // 스트림 URL에서 Invidious 호스트를 우리 프록시로 변경
+    const videoStreams = (data.formatStreams || []).map((stream: any) => ({
+      url: stream.url || '',
+      format: stream.container || 'mp4',
+      quality: stream.qualityLabel || stream.quality || '',
+      mimeType: stream.type || '',
+      height: stream.height || 0,
+      width: stream.width || 0,
+      bitrate: stream.bitrate || 0,
+      videoOnly: false,
+      itag: stream.itag,
+    }));
     
-    const videoStreams = [...formats, ...adaptiveFormats]
-      .filter((f: any) => f.has_video)
-      .map((f: any) => ({
-        url: f.url || '',
-        format: f.container || 'mp4',
-        quality: f.quality_label || f.quality || '',
-        mimeType: f.mime_type || '',
-        height: f.height || 0,
-        width: f.width || 0,
-        bitrate: f.bitrate || 0,
-        videoOnly: !f.has_audio,
-        itag: f.itag,
+    // Adaptive formats (video only, audio only)
+    const adaptiveVideoStreams = (data.adaptiveFormats || [])
+      .filter((f: any) => f.type?.includes('video'))
+      .map((stream: any) => ({
+        url: stream.url || '',
+        format: stream.container || 'mp4',
+        quality: stream.qualityLabel || stream.quality || '',
+        mimeType: stream.type || '',
+        height: stream.height || 0,
+        width: stream.width || 0,
+        bitrate: stream.bitrate || 0,
+        videoOnly: !stream.type?.includes('audio'),
+        itag: stream.itag,
       }));
-
-    const audioStreams = adaptiveFormats
-      .filter((f: any) => f.has_audio && !f.has_video)
-      .map((f: any) => ({
-        url: f.url || '',
-        format: f.container || 'webm',
-        quality: f.audio_quality || 'medium',
-        mimeType: f.mime_type || '',
-        bitrate: f.bitrate || 0,
+    
+    const audioStreams = (data.adaptiveFormats || [])
+      .filter((f: any) => f.type?.includes('audio'))
+      .map((stream: any) => ({
+        url: stream.url || '',
+        format: stream.container || 'webm',
+        quality: stream.audioQuality || 'medium',
+        mimeType: stream.type || '',
+        bitrate: stream.bitrate || 0,
         videoOnly: false,
-        itag: f.itag,
+        itag: stream.itag,
       }));
-
+    
     const videoInfo = {
-      title: info.basic_info?.title || '',
+      title: data.title || '',
       videoId: videoId,
-      description: info.basic_info?.short_description || '',
-      author: info.basic_info?.author || '',
-      authorId: info.basic_info?.channel_id || '',
-      authorUrl: `/channel/${info.basic_info?.channel_id || ''}`,
-      authorVerified: false,
-      authorThumbnail: '',
-      subscriberCount: 0,
-      viewCount: info.basic_info?.view_count || 0,
-      likeCount: info.basic_info?.like_count || 0,
-      dislikeCount: 0,
-      lengthSeconds: info.basic_info?.duration || 0,
-      publishedText: info.primary_info?.published?.text || '',
-      videoThumbnails: [{ 
-        url: info.basic_info?.thumbnail?.[0]?.url || `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`,
-        width: 1280, 
-        height: 720 
-      }],
-      liveNow: info.basic_info?.is_live || false,
-      hlsUrl: info.streaming_data?.hls_manifest_url || null,
-      dashUrl: info.streaming_data?.dash_manifest_url || null,
+      description: data.description || '',
+      author: data.author || '',
+      authorId: data.authorId || '',
+      authorUrl: `/channel/${data.authorId || ''}`,
+      authorVerified: data.authorVerified || false,
+      authorThumbnail: data.authorThumbnails?.[0]?.url || '',
+      subscriberCount: data.subCountText || 0,
+      viewCount: data.viewCount || 0,
+      likeCount: data.likeCount || 0,
+      dislikeCount: data.dislikeCount || 0,
+      lengthSeconds: data.lengthSeconds || 0,
+      publishedText: data.publishedText || '',
+      videoThumbnails: data.videoThumbnails || [{ url: `/vi/${videoId}/maxresdefault.jpg`, width: 1280, height: 720 }],
+      liveNow: data.liveNow || false,
+      hlsUrl: data.hlsUrl || null,
+      dashUrl: data.dashUrl || null,
       audioStreams,
-      videoStreams,
-      recommendedVideos: (info.watch_next_feed || []).slice(0, 10).map((v: any) => ({
+      videoStreams: [...videoStreams, ...adaptiveVideoStreams],
+      recommendedVideos: (data.recommendedVideos || []).slice(0, 10).map((v: any) => ({
         type: 'video',
-        title: v.title?.text || '',
-        videoId: v.id,
-        author: v.author?.name || '',
-        authorId: v.author?.id || '',
-        authorUrl: '',
+        title: v.title || '',
+        videoId: v.videoId,
+        author: v.author || '',
+        authorId: v.authorId || '',
+        authorUrl: `/channel/${v.authorId || ''}`,
         authorVerified: false,
-        videoThumbnails: [{ 
-          url: `https://i.ytimg.com/vi/${v.id}/mqdefault.jpg`,
-          width: 320, 
-          height: 180 
-        }],
+        videoThumbnails: v.videoThumbnails || [{ url: `/vi/${v.videoId}/mqdefault.jpg`, width: 320, height: 180 }],
         description: '',
-        viewCount: 0,
-        viewCountText: v.short_view_count?.text || '',
-        publishedText: '',
-        lengthSeconds: v.duration?.seconds || 0,
+        viewCount: v.viewCount || 0,
+        viewCountText: v.viewCountText || '',
+        publishedText: v.publishedText || '',
+        lengthSeconds: v.lengthSeconds || 0,
         liveNow: false,
       })),
     };
-
+    
     res.json(videoInfo);
   } catch (error: any) {
     console.error('Video info error:', error);
@@ -313,59 +265,16 @@ app.get('/api/video/:videoId', async (req, res) => {
   }
 });
 
-// 스트림 URL
-app.get('/api/stream/:videoId', async (req, res) => {
-  const { videoId } = req.params;
-  const { itag } = req.query;
-  
-  if (!client) {
-    const success = await initInnerTube();
-    if (!success) {
-      return res.status(503).json({ error: 'Service initializing', details: initError });
-    }
-  }
-  
-  try {
-    const info = await client.getInfo(videoId);
-    const formats = [...(info.streaming_data?.formats || []), ...(info.streaming_data?.adaptive_formats || [])];
-    
-    let format = itag 
-      ? formats.find((f: any) => f.itag == itag)
-      : formats.find((f: any) => f.has_video && f.has_audio);
-    
-    if (!format) format = formats[0];
-    
-    if (!format?.url && format?.decipher) {
-      format.url = await format.decipher(client.session.player);
-    }
-    
-    if (!format?.url) {
-      return res.status(404).json({ error: 'No stream URL found' });
-    }
-
-    res.json({ url: format.url, itag: format.itag, quality: format.quality_label || format.quality });
-  } catch (error: any) {
-    console.error('Stream error:', error);
-    res.status(500).json({ error: 'Failed to get stream', details: error.message });
-  }
-});
-
-// 비디오 스트림 프록시 (CORS 우회) - formats 직접 사용
+// 비디오 스트림 프록시 (Invidious 스트림 URL 프록시)
 app.get('/api/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
-  const { quality } = req.query;
-  
-  if (!client) {
-    const success = await initInnerTube();
-    if (!success) {
-      return res.status(503).json({ error: 'Service initializing' });
-    }
-  }
+  const { quality, itag } = req.query;
   
   try {
-    const info = await client.getInfo(videoId);
+    // Invidious에서 비디오 정보 가져오기
+    const data = await invidiousRequest(`/api/v1/videos/${videoId}`);
     
-    // 요청된 품질에서 숫자만 추출 (예: "720p60" -> 720)
+    // 요청된 품질에 맞는 스트림 찾기
     let targetHeight = 720;
     if (quality && typeof quality === 'string') {
       const match = quality.match(/(\d+)/);
@@ -374,113 +283,83 @@ app.get('/api/proxy/:videoId', async (req, res) => {
       }
     }
     
-    console.log(`[Proxy] Video: ${videoId}, Target height: ${targetHeight}`);
-
-    // 방법 1: formats에서 영상+오디오 결합된 스트림 찾기 (360p, 720p만 있음)
-    const formats = info.streaming_data?.formats || [];
-    const combinedFormats = formats.filter((f: any) => f.has_video && f.has_audio);
-    
-    // 요청된 품질에 가장 가까운 포맷 찾기
-    let format = combinedFormats.find((f: any) => f.height === targetHeight);
-    if (!format) {
-      // 가장 높은 품질 선택
-      format = combinedFormats.sort((a: any, b: any) => (b.height || 0) - (a.height || 0))[0];
-    }
-    
-    if (format) {
-      // formats에서 URL 가져오기 (ytmous 방식)
-      let streamUrl = format.url;
-      
-      // URL이 없으면 decipher 시도
-      if (!streamUrl && format.decipher) {
-        try {
-          streamUrl = await format.decipher(client.session.player);
-        } catch (e) {
-          console.error('[Proxy] Decipher failed:', e);
-        }
-      }
-      
-      if (streamUrl) {
-        // ytmous 방식: cpn 파라미터 추가 (Client Playback Nonce - 중요!)
-        if (info.cpn) {
-          streamUrl += '&cpn=' + info.cpn;
-        }
-        
-        console.log(`[Proxy] Using combined format: ${format.height}p`);
-        
-        // ytmous 방식: undici 사용, googlebot User-Agent, maxRedirections
-        const range = req.headers.range || 'bytes=0-';
-        
-        try {
-          // undici.request 사용 (ytmous 방식)
-          const response = await undici.request(streamUrl, {
-            headers: {
-              'User-Agent': 'googlebot',
-              range,
-            },
-            maxRedirections: 4,
-          });
-          
-          // 응답 헤더 설정
-          res.status(response.statusCode);
-          
-          for (const h of ['Accept-Ranges', 'Content-Type', 'Content-Range', 'Content-Length', 'Cache-Control']) {
-            const headerValue = response.headers[h.toLowerCase()];
-            if (headerValue) res.setHeader(h, headerValue);
-          }
-          
-          // 스트림 파이프 (ytmous 방식)
-          for await (const chunk of response.body) {
-            if (res.closed) break;
-            res.write(chunk);
-          }
-          res.end();
-          return;
-        } catch (err) {
-          console.error('[Proxy] Undici request failed:', err);
-          throw err;
-        }
-      }
-    }
-    
-    // 방법 2: download() 메서드 사용 (ffmpeg 필요, 고화질용)
-    console.log(`[Proxy] Falling back to download() method`);
-    
-    const stream = await info.download({
-      type: 'video+audio',
-      quality: 'best',
-    });
+    // formatStreams에서 영상+오디오 결합된 스트림 찾기
+    const formatStreams = data.formatStreams || [];
+    let stream = formatStreams.find((s: any) => s.height === targetHeight);
     
     if (!stream) {
-      throw new Error('Failed to create stream');
+      // 가장 높은 품질 선택
+      stream = formatStreams.sort((a: any, b: any) => (b.height || 0) - (a.height || 0))[0];
     }
     
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'public, max-age=3600');
+    // itag로 직접 찾기
+    if (itag) {
+      const allFormats = [...formatStreams, ...(data.adaptiveFormats || [])];
+      const found = allFormats.find((s: any) => s.itag == itag);
+      if (found) stream = found;
+    }
     
-    const reader = stream.getReader();
+    if (!stream || !stream.url) {
+      return res.status(404).json({ error: 'No suitable stream found' });
+    }
     
-    const pump = async (): Promise<void> => {
-      try {
-        const { done, value } = await reader.read();
-        if (done) {
-          res.end();
-          return;
-        }
-        res.write(Buffer.from(value));
-        return pump();
-      } catch (err) {
-        console.error('Stream read error:', err);
-        res.end();
-      }
+    console.log(`[Proxy] Streaming ${videoId} at ${stream.qualityLabel || stream.quality}`);
+    
+    // Range 헤더 처리
+    const headers: Record<string, string> = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     };
     
-    req.on('close', () => {
-      reader.cancel();
-    });
+    if (req.headers.range) {
+      headers['Range'] = req.headers.range;
+    }
     
-    await pump();
+    // YouTube/Invidious 스트림 가져오기
+    const response = await fetch(stream.url, { headers });
+    
+    if (!response.ok) {
+      throw new Error(`Stream returned ${response.status}`);
+    }
+    
+    // 응답 헤더 설정
+    res.status(response.status);
+    
+    const contentType = response.headers.get('content-type');
+    const contentLength = response.headers.get('content-length');
+    const contentRange = response.headers.get('content-range');
+    const acceptRanges = response.headers.get('accept-ranges');
+    
+    if (contentType) res.setHeader('Content-Type', contentType);
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+    if (contentRange) res.setHeader('Content-Range', contentRange);
+    if (acceptRanges) res.setHeader('Accept-Ranges', acceptRanges);
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    
+    // 스트림 파이프
+    if (response.body) {
+      const reader = response.body.getReader();
+      
+      const pump = async (): Promise<void> => {
+        try {
+          const { done, value } = await reader.read();
+          if (done || res.closed) {
+            res.end();
+            return;
+          }
+          res.write(Buffer.from(value));
+          return pump();
+        } catch (err) {
+          console.error('Stream error:', err);
+          res.end();
+        }
+      };
+      
+      req.on('close', () => {
+        reader.cancel();
+      });
+      
+      await pump();
+    }
   } catch (error: any) {
     console.error('Proxy error:', error);
     if (!res.headersSent) {
@@ -489,27 +368,22 @@ app.get('/api/proxy/:videoId', async (req, res) => {
   }
 });
 
-// 썸네일 프록시 (User-Agent 포함)
+// 썸네일 프록시
 app.get('/vi/:videoId/:quality.jpg', async (req, res) => {
   const { videoId, quality } = req.params;
   
-  // 여러 썸네일 URL 시도 (fallback)
   const thumbnailUrls = [
     `https://i.ytimg.com/vi/${videoId}/${quality}.jpg`,
     `https://img.youtube.com/vi/${videoId}/${quality}.jpg`,
     `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-    `https://img.youtube.com/vi/${videoId}/0.jpg`,
   ];
   
   for (const url of thumbnailUrls) {
     try {
       const response = await fetch(url, {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Referer': 'https://www.youtube.com/',
-        }
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        },
       });
       
       if (response.ok) {
@@ -519,32 +393,35 @@ app.get('/vi/:videoId/:quality.jpg', async (req, res) => {
         res.send(Buffer.from(buffer));
         return;
       }
-    } catch (error) {
-      console.log(`Thumbnail fetch failed for ${url}`);
+    } catch (e) {
+      // 다음 URL 시도
     }
   }
   
-  // 모든 URL 실패 시 플레이스홀더 반환
   res.status(404).send('Thumbnail not found');
 });
 
 // SPA fallback (프로덕션용)
 if (process.env.NODE_ENV === 'production') {
   app.use((req, res, next) => {
-    // API 요청은 그대로 통과
     if (req.path.startsWith('/api') || req.path.startsWith('/vi')) {
       return next();
     }
-    // 그 외 모든 요청은 index.html 반환
     res.sendFile(path.join(__dirname, '../dist/index.html'));
   });
 }
 
-// 서버 시작 - 바로 리스닝 시작 (InnerTube 초기화 기다리지 않음)
+// 서버 시작
 const server = app.listen(PORT, () => {
   console.log(`🚀 YouPro API Server running on port ${PORT}`);
-  console.log(`📺 InnerTube will initialize on first request`);
+  console.log(`📺 Using Invidious API for YouTube data`);
+  
+  // 시작 시 작동하는 인스턴스 확인
+  getWorkingInstance().then(instance => {
+    if (instance) {
+      console.log(`✅ Working Invidious instance: ${instance}`);
+    } else {
+      console.log('⚠️ No working Invidious instance found');
+    }
+  });
 });
-
-// 백그라운드에서 InnerTube 초기화 시작
-initInnerTube();
