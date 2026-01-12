@@ -11,7 +11,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// CORS 설정 (배포 환경용)
+// CORS 설정
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -27,8 +27,9 @@ if (process.env.NODE_ENV === 'production') {
 // InnerTube 클라이언트
 let client: any = null;
 let initPromise: Promise<boolean> | null = null;
+let initError: string | null = null;
 
-// InnerTube 초기화 (싱글톤)
+// InnerTube 초기화 (비동기, 논블로킹)
 async function initInnerTube(): Promise<boolean> {
   if (client) return true;
   
@@ -36,14 +37,17 @@ async function initInnerTube(): Promise<boolean> {
   
   initPromise = (async () => {
     try {
+      console.log('📺 Initializing InnerTube...');
       client = await Innertube.create({
-        location: 'KR',
-        lang: 'ko',
+        location: 'US',
+        lang: 'en',
       });
       console.log('✅ InnerTube client initialized');
+      initError = null;
       return true;
-    } catch (error) {
-      console.error('❌ Failed to initialize InnerTube:', error);
+    } catch (error: any) {
+      console.error('❌ Failed to initialize InnerTube:', error.message);
+      initError = error.message;
       initPromise = null;
       return false;
     }
@@ -52,22 +56,27 @@ async function initInnerTube(): Promise<boolean> {
   return initPromise;
 }
 
-// 유틸리티 함수
-function formatViewCount(count: number): string {
-  if (!count) return '0';
-  if (count >= 1000000000) return `${(count / 1000000000).toFixed(1)}B`;
-  if (count >= 1000000) return `${(count / 1000000).toFixed(1)}M`;
-  if (count >= 1000) return `${(count / 1000).toFixed(1)}K`;
-  return count.toString();
-}
-
-// 헬스 체크
-app.get('/api/health', async (req, res) => {
-  const success = await initInnerTube();
-  if (!success) {
-    return res.status(500).json({ status: 'error', message: 'InnerTube not initialized' });
+// 루트 경로 - Railway 헬스 체크용
+app.get('/', (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    // SPA 서빙
+    return res.sendFile(path.join(__dirname, '../dist/index.html'));
   }
-  res.json({ status: 'ok', message: 'InnerTube ready' });
+  res.json({ 
+    status: 'ok', 
+    message: 'YouPro API Server',
+    innertube: client ? 'ready' : 'initializing',
+    error: initError
+  });
+});
+
+// 헬스 체크 - 항상 응답
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: client ? 'ok' : 'initializing', 
+    message: client ? 'InnerTube ready' : 'InnerTube initializing...',
+    error: initError
+  });
 });
 
 // 검색
@@ -78,9 +87,11 @@ app.get('/api/search', async (req, res) => {
     return res.status(400).json({ error: 'Query parameter "q" is required' });
   }
   
-  const success = await initInnerTube();
-  if (!success || !client) {
-    return res.status(500).json({ error: 'Service unavailable' });
+  if (!client) {
+    const success = await initInnerTube();
+    if (!success) {
+      return res.status(503).json({ error: 'Service initializing, please try again', details: initError });
+    }
   }
   
   try {
@@ -116,9 +127,11 @@ app.get('/api/search', async (req, res) => {
 
 // 트렌딩
 app.get('/api/trending', async (req, res) => {
-  const success = await initInnerTube();
-  if (!success || !client) {
-    return res.status(500).json({ error: 'Service unavailable' });
+  if (!client) {
+    const success = await initInnerTube();
+    if (!success) {
+      return res.status(503).json({ error: 'Service initializing, please try again', details: initError });
+    }
   }
   
   try {
@@ -186,9 +199,11 @@ app.get('/api/trending', async (req, res) => {
 app.get('/api/video/:videoId', async (req, res) => {
   const { videoId } = req.params;
   
-  const success = await initInnerTube();
-  if (!success || !client) {
-    return res.status(500).json({ error: 'Service unavailable' });
+  if (!client) {
+    const success = await initInnerTube();
+    if (!success) {
+      return res.status(503).json({ error: 'Service initializing', details: initError });
+    }
   }
   
   try {
@@ -282,9 +297,11 @@ app.get('/api/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
   const { itag } = req.query;
   
-  const success = await initInnerTube();
-  if (!success || !client) {
-    return res.status(500).json({ error: 'Service unavailable' });
+  if (!client) {
+    const success = await initInnerTube();
+    if (!success) {
+      return res.status(503).json({ error: 'Service initializing', details: initError });
+    }
   }
   
   try {
@@ -336,9 +353,11 @@ if (process.env.NODE_ENV === 'production') {
   });
 }
 
-// 서버 시작
-app.listen(PORT, async () => {
+// 서버 시작 - 바로 리스닝 시작 (InnerTube 초기화 기다리지 않음)
+const server = app.listen(PORT, () => {
   console.log(`🚀 YouPro API Server running on port ${PORT}`);
-  console.log('📺 Initializing InnerTube client...');
-  await initInnerTube();
+  console.log(`📺 InnerTube will initialize on first request`);
 });
+
+// 백그라운드에서 InnerTube 초기화 시작
+initInnerTube();
