@@ -332,7 +332,7 @@ app.get('/api/stream/:videoId', async (req, res) => {
 // 비디오 스트림 프록시 (CORS 우회) - download() 메서드 사용
 app.get('/api/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
-  const { itag, quality } = req.query;
+  const { quality } = req.query;
   
   if (!client) {
     const success = await initInnerTube();
@@ -344,28 +344,26 @@ app.get('/api/proxy/:videoId', async (req, res) => {
   try {
     const info = await client.getInfo(videoId);
     
+    // quality 파라미터를 youtubei.js가 이해하는 형식으로 변환
+    // 예: "1080p" -> "1080p", "720p" -> "720p", "360p" -> "360p"
+    let targetQuality: string = 'best';
+    
+    if (quality && typeof quality === 'string') {
+      // "1080p" -> "1080p" (그대로 사용)
+      targetQuality = quality;
+    }
+    
+    console.log(`[Proxy] Video: ${videoId}, Quality: ${targetQuality}`);
+
     // download 옵션 설정
+    // type: 'video+audio'는 자동으로 영상과 오디오를 합쳐줌 (1080p 이상도 지원)
     const downloadOptions: any = {
-      type: 'video+audio', // 영상+오디오 합친 스트림
-      quality: 'best',
+      type: 'video+audio',
+      quality: targetQuality,
     };
-    
-    // itag가 지정된 경우 해당 포맷 사용
-    if (itag) {
-      const formats = [...(info.streaming_data?.formats || []), ...(info.streaming_data?.adaptive_formats || [])];
-      const format = formats.find((f: any) => f.itag == itag);
-      if (format) {
-        downloadOptions.format = format;
-      }
-    }
-    
-    // 품질 지정된 경우
-    if (quality) {
-      downloadOptions.quality = quality;
-    }
 
     // youtubei.js의 download() 메서드로 직접 스트림 가져오기
-    // 이 방식은 IP 검증을 우회함
+    // 이 방식은 IP 검증을 우회함 (서버에서 직접 다운로드하므로)
     const stream = await info.download(downloadOptions);
     
     // 응답 헤더 설정

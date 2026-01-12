@@ -1,5 +1,5 @@
 import { useState, useRef, useMemo } from 'react';
-import type { VideoInfo, PipedStream } from '../types/video';
+import type { VideoInfo } from '../types/video';
 
 interface VideoPlayerProps {
   video: VideoInfo;
@@ -14,37 +14,51 @@ export default function VideoPlayer({ video }: VideoPlayerProps) {
   const [volume, setVolume] = useState(1);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showQualityMenu, setShowQualityMenu] = useState(false);
-  const [selectedItag, setSelectedItag] = useState<string | null>(null);
 
-  // 비디오+오디오가 합쳐진 스트림 (videoOnly가 false인 것)
-  const combinedStreams: PipedStream[] = useMemo(() => {
-    return (video.videoStreams || [])
-      .filter((s) => !s.videoOnly && s.url)
-      .sort((a, b) => (b.height || 0) - (a.height || 0));
+  // 모든 비디오 스트림에서 고유한 품질 옵션 추출
+  // youtubei.js의 download()가 자동으로 영상+오디오를 합쳐주므로 videoOnly도 포함
+  const qualityOptions = useMemo(() => {
+    const streams = video.videoStreams || [];
+    
+    // 고유한 해상도만 추출 (중복 제거)
+    const uniqueQualities = new Map<number, { quality: string; height: number; itag?: string }>();
+    
+    streams
+      .filter((s) => s.height && s.height > 0)
+      .forEach((s) => {
+        const height = s.height || 0;
+        // 더 높은 비트레이트 또는 첫 번째 것 선택
+        if (!uniqueQualities.has(height) || (s.bitrate || 0) > (uniqueQualities.get(height)?.height || 0)) {
+          uniqueQualities.set(height, {
+            quality: s.quality || `${height}p`,
+            height: height,
+            itag: s.itag,
+          });
+        }
+      });
+    
+    // 해상도 순으로 정렬 (높은 것부터)
+    return Array.from(uniqueQualities.values()).sort((a, b) => b.height - a.height);
   }, [video.videoStreams]);
 
-  // 사용 가능한 품질 옵션
-  const qualityOptions = combinedStreams;
-
-  // 초기 품질 설정 (720p 또는 가장 높은 품질)
-  const selectedStream = useMemo(() => {
-    if (selectedItag) {
-      return qualityOptions.find((q) => q.itag === selectedItag) || qualityOptions[0];
-    }
-    if (qualityOptions.length === 0) return null;
-    const preferred = qualityOptions.find((q) => q.quality === '720p') 
-      || qualityOptions.find((q) => q.height === 720)
-      || qualityOptions.find((q) => q.quality === '360p')
-      || qualityOptions[0];
-    return preferred;
-  }, [qualityOptions, selectedItag]);
+  // 선택된 품질 (기본값: 720p 또는 가장 가까운 것)
+  const [selectedQuality, setSelectedQuality] = useState<string>('720p');
+  
+  const currentQuality = useMemo(() => {
+    const found = qualityOptions.find((q) => q.quality === selectedQuality);
+    if (found) return found;
+    // 720p가 없으면 가장 가까운 것 선택
+    const closest = qualityOptions.find((q) => q.height <= 720) || qualityOptions[0];
+    return closest;
+  }, [qualityOptions, selectedQuality]);
 
   // 프록시 URL 생성 (서버를 통해 스트리밍)
+  // quality 파라미터로 해상도 지정 - 서버에서 download({ type: 'video+audio' })로 합쳐줌
   const proxyUrl = useMemo(() => {
     if (!video.videoId) return '';
-    const itag = selectedStream?.itag || selectedItag || '';
-    return `/api/proxy/${video.videoId}${itag ? `?itag=${itag}` : ''}`;
-  }, [video.videoId, selectedStream, selectedItag]);
+    const quality = currentQuality?.quality || '720p';
+    return `/api/proxy/${video.videoId}?quality=${encodeURIComponent(quality)}`;
+  }, [video.videoId, currentQuality]);
 
   // HLS 스트림 사용 가능 여부
   const hlsUrl = video.hlsUrl;
@@ -102,9 +116,9 @@ export default function VideoPlayer({ video }: VideoPlayerProps) {
   };
 
   // 품질 변경
-  const handleQualityChange = (itag: string) => {
+  const handleQualityChange = (quality: string) => {
     const currentTimeValue = videoRef.current?.currentTime || 0;
-    setSelectedItag(itag);
+    setSelectedQuality(quality);
     setShowQualityMenu(false);
     
     // 비디오 로드 후 이전 재생 위치로 이동
@@ -117,7 +131,7 @@ export default function VideoPlayer({ video }: VideoPlayerProps) {
   };
 
   // 현재 품질 라벨
-  const currentQualityLabel = selectedStream?.quality || (selectedStream?.height ? `${selectedStream.height}p` : 'Auto');
+  const currentQualityLabel = currentQuality?.quality || 'Auto';
 
   // 썸네일 URL (프록시 사용)
   const thumbnailUrl = `/vi/${video.videoId}/maxresdefault.jpg`;
@@ -243,13 +257,13 @@ export default function VideoPlayer({ video }: VideoPlayerProps) {
                     <div className="absolute bottom-full right-0 mb-2 bg-[var(--color-bg-dark)]/95 rounded-lg py-2 min-w-[120px] backdrop-blur-sm">
                       {qualityOptions.map((q, idx) => (
                         <button
-                          key={`${q.itag}-${idx}`}
-                          onClick={() => handleQualityChange(q.itag || '')}
+                          key={`${q.quality}-${idx}`}
+                          onClick={() => handleQualityChange(q.quality)}
                           className={`w-full px-4 py-2 text-left text-sm hover:bg-white/10 transition-colors ${
-                            q.itag === selectedStream?.itag ? 'text-[var(--color-primary)]' : ''
+                            q.quality === currentQuality?.quality ? 'text-[var(--color-primary)]' : ''
                           }`}
                         >
-                          {q.quality || `${q.height}p`}
+                          {q.quality}
                         </button>
                       ))}
                     </div>
